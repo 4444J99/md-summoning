@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""md-summoning: centralize all ~/ .md files into ~/Meta/Documents/."""
+"""md-knowledge: canonical archive of all .md files at ~ into /Users/4jp/_doc/."""
 
 from __future__ import annotations
 
@@ -9,73 +9,99 @@ import json
 import logging
 import os
 import re
-import stat
+import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Iterator
 
 logger = logging.getLogger("summon")
 
-
-def load_config(config_path: Path) -> dict:
-    text = config_path.read_text()
-    if config_path.suffix in (".yaml", ".yml"):
-        try:
-            import yaml
-
-            return yaml.safe_load(text)
-        except ImportError:
-            logger.warning("PyYAML not available, falling back to JSON parsing")
-    return json.loads(text)
-
-
-DEFAULT_CONFIG = {
-    "central_dir": "~/Meta/Documents",
-    "min_file_bytes": 100,
-    "batch_size": 1000,
-    "hash_algorithm": "sha256",
-    "flat_hash_length": 12,
-    "log_level": "INFO",
-    "exclusions": [
-        "*/.git/objects/**",
-        "*/node_modules/**",
-        "*/Library/**",
-        ".Trash/**",
-        "*/.Trash/**",
-        "*/.cache/**",
-        "*/Caches/**",
-        "*/.specstory/history/**",
-        "*/.claude/projects/*/memory/**",
-        "*/.gemini/**",
-        "*/.serena/**",
-        "*/.codex/memory/**",
-    ],
-    "thresholds": {
-        "very_large_file_bytes": 10_485_760,
-        "flat_hash_collision_retry_length": 16,
-        "checkpoint_interval": 10_000,
-        "hardlink_dedup_threshold_bytes": 1024,
-    },
-    "paths": {
-        "provenance_dir": "provenance",
-        "registry_file": "provenance/registry.jsonl",
-        "registry_schema": "provenance/registry-schema.json",
-        "breadcrumb_template": "provenance/breadcrumb-template.md",
-        "manifest": "MANIFEST.md",
-        "errors_log": "provenance/errors.log",
-    },
-    "reporting": {
-        "include_sample_paths": 10,
-        "verify_sample_percent": 1,
-    },
-}
-
-
 HOME = Path.home()
-EXCLUSION_PATTERNS: list[re.Pattern] = []
+DOC_DIR = Path("/Users/4jp/_doc")
+CONTENT_DIR = DOC_DIR / "content"
+MANIFEST_PATH = DOC_DIR / "manifest.jsonl"
+DOCUMENTS_DIR = DOC_DIR / "Documents"
+HASH_LEN = 12
+EXCLUSIONS = [
+    "*/node_modules/*",
+    "*/Library/*",
+    "*/.Trash/*",
+    "*/.cache/*",
+    "*/Caches/*",
+    "*/.specstory/history/*",
+    "*/.claude/projects/*/memory/*",
+    "*/.gemini/*",
+    "*/.serena/*",
+    "*/.codex/memory/*",
+    "*/.git/objects/*",
+    "*/__pycache__/*",
+    "*/vendor/*",
+    "*/venv/*",
+    "*/.venv/*",
+    "*/dist/*",
+    "*/build/*",
+    ".Trash/*",
+    "*/.local/share/Trash/*",
+    "*/.gitbook/*",
+    "*/node_modules/*",
+    "*/.next/*",
+]
+EXCLUDED_PREFIXES = ["/Users/4jp/_doc/"]
+
+COMPILED_EXCLUSIONS: list[re.Pattern] = []
+
+SECRET_PATTERNS: list[re.Pattern] = [
+    re.compile(r"(sk-[A-Za-z0-9]{20,})"),  # OpenAI
+    re.compile(r"(sk-ant-[A-Za-z0-9]{20,})"),  # Anthropic
+    re.compile(r"(gh[pousr]_[A-Za-z0-9]{36,})"),  # GitHub tokens
+    re.compile(r"(xox[bpras]-[A-Za-z0-9-]{20,})"),  # Slack
+    re.compile(r"(AKIA[0-9A-Z]{16})"),  # AWS access key ID
+    re.compile(
+        r"(-----BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY-----).+?"
+        r"-----END \2 PRIVATE KEY-----",
+        re.DOTALL,
+    ),  # Private key block
+    re.compile(
+        r"(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})"
+    ),  # JWT
+    re.compile(r"(AIza[0-9A-Za-z_-]{35})"),  # Google API key
+    re.compile(r"(1qaz2wsx3edc[a-zA-Z0-9_\-]{16,})"),  # Telegram bot token
+    re.compile(r"(sk_live_[0-9a-zA-Z]{20,})"),  # Stripe live key
+    re.compile(r"(rk_live_[0-9a-zA-Z]{20,})"),  # Stripe live restricted
+]
+
+
+def apply_scrub(content: bytes) -> bytes:
+    """Redact known secret patterns, replacing values with ***REDACTED***."""
+    text = content.decode("utf-8", errors="replace")
+    for pat in SECRET_PATTERNS:
+        text = pat.sub(r"\1***REDACTED***", text)
+    return text.encode("utf-8")
+
+
+def copy_or_scrub(
+    src: Path, hash_val: str, scrub: bool
+) -> tuple[Path, str, str | None]:
+    """Copy (or scrub) src into content store. Returns (dest_path, store_hash, original_hash)."""
+    prefix = hash_val[:2]
+    dest_dir = CONTENT_DIR / prefix
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    if not scrub:
+        dest = dest_dir / f"{hash_val}.md"
+        if not dest.exists():
+            shutil.copy2(src, dest)
+        return dest, hash_val, None
+
+    original_hash = hash_val
+    scrubbed = apply_scrub(src.read_bytes())
+    store_hash = hashlib.sha256(scrubbed).hexdigest()
+    dest = dest_dir / f"{store_hash}.md"
+    if not dest.exists():
+        dest.write_bytes(scrubbed)
+    return dest, store_hash, original_hash
 
 
 def compile_exclusions(patterns: list[str]) -> list[re.Pattern]:
@@ -90,42 +116,23 @@ def compile_exclusions(patterns: list[str]) -> list[re.Pattern]:
                 regex_parts.append("[^/]*")
             else:
                 regex_parts.append(re.escape(part))
-        compiled.append(re.compile("^" + "/".join(regex_parts) + "$"))
+        compiled.append(re.compile("/".join(regex_parts)))
     return compiled
 
 
-def is_excluded(path: Path, compiled_patterns: list[re.Pattern]) -> bool:
-    as_str = str(path)
-    for pat in compiled_patterns:
-        if pat.search(as_str):
+def is_excluded(path: Path) -> bool:
+    s = str(path)
+    for pre in EXCLUDED_PREFIXES:
+        if s.startswith(pre):
+            return True
+    for pat in COMPILED_EXCLUSIONS:
+        if pat.fullmatch(s) or pat.search(s):
             return True
     return False
 
 
-@dataclass
-class FileRecord:
-    path: str
-    hash: str
-    hash_prefix: str
-    size: int
-    mtime: float
-    kind: str
-    depth: int
-    central_path: str = ""
-    repo: str = ""
-    repo_root: str = ""
-    flat_name: str = ""
-    is_symlink: bool = False
-    summoned_at: str = ""
-    status: str = "active"
-    note: str = ""
-
-
-def enumerate_md_files(
-    search_root: Path,
-    exclusions: list[str],
-) -> Iterator[Path]:
-    compiled = compile_exclusions(exclusions)
+def enumerate_md_files(root: Path | None = None) -> list[Path]:
+    scan_root = root if root else HOME
     result = subprocess.run(
         [
             "fd",
@@ -139,62 +146,41 @@ def enumerate_md_files(
         ],
         capture_output=True,
         text=True,
-        cwd=search_root,
-        timeout=300,
+        cwd=scan_root,
+        timeout=600,
     )
     if result.returncode != 0:
         logger.error("fd failed: %s", result.stderr)
         sys.exit(1)
+    paths = []
     for line in result.stdout.strip().splitlines():
-        path = Path(line)
-        if not path.exists():
-            continue
-        if is_excluded(path, compiled):
-            continue
-        yield path
+        p = Path(line)
+        if p.exists() and not is_excluded(p):
+            paths.append(p)
+    return paths
 
 
-def stat_file(path: Path) -> tuple[int, float, bool]:
+def compute_hash(path: Path) -> str | None:
     try:
-        st = path.stat()
-        is_sym = path.is_symlink()
-        real = path.resolve()
-        if real != path:
-            st = real.stat()
-        return st.st_size, st.st_mtime, is_sym
-    except (OSError, PermissionError) as e:
-        logger.warning("Cannot stat %s: %s", path, e)
-        return 0, 0.0, False
-
-
-def compute_hash(path: Path, algorithm: str = "sha256") -> str | None:
-    try:
-        h = hashlib.new(algorithm)
+        h = hashlib.sha256()
         with open(path, "rb") as f:
-            while True:
-                chunk = f.read(65536)
-                if not chunk:
-                    break
+            while chunk := f.read(65536):
                 h.update(chunk)
         return h.hexdigest()
-    except (OSError, PermissionError, ValueError) as e:
-        logger.warning("Cannot hash %s: %s", path, e)
+    except (OSError, PermissionError):
         return None
 
 
 def detect_git_root(path: Path) -> Path | None:
     for parent in [path] + list(path.parents):
-        git_dir = parent / ".git"
-        if git_dir.exists():
+        git = parent / ".git"
+        if git.exists():
             return parent
-
-        git_file = parent / ".git"
-        if git_file.is_file():
+        if git.is_file():
             try:
-                content = git_file.read_text().strip()
-                match = re.match(r"^gitdir:\s+(.+)", content)
-                if match:
-                    resolved = Path(match.group(1)).resolve()
+                m = re.match(r"gitdir:\s+(.+)", git.read_text().strip())
+                if m:
+                    resolved = Path(m.group(1)).resolve()
                     for p in [resolved] + list(resolved.parents):
                         if (p / "HEAD").exists():
                             return parent
@@ -203,275 +189,290 @@ def detect_git_root(path: Path) -> Path | None:
     return None
 
 
-def detect_repo_org(repo_root: Path) -> str:
-    parts = (
-        repo_root.relative_to(HOME).parts
-        if HOME in repo_root.parents
-        else repo_root.parts
-    )
-    return "--".join(parts[:2]) if len(parts) >= 2 else parts[0]
+def repo_relative_name(repo_root: Path) -> str:
+    try:
+        parts = repo_root.relative_to(HOME).parts
+        if len(parts) >= 2:
+            return "--".join(parts[:2])
+        return parts[0]
+    except ValueError:
+        return repo_root.name
 
 
-def classify_path(
-    path: Path,
-    repo_root: Path | None,
-) -> tuple[str, int, str, str]:
-    if repo_root:
-        if path.is_symlink():
-            return ("symlink-resolved", 0, "", str(repo_root))
-        depth = len(path.relative_to(repo_root).parent.parts)
-        repo_org = detect_repo_org(repo_root)
-        return ("git-tracked", depth, repo_org, str(repo_root))
-    else:
-        depth = len(path.relative_to(HOME).parent.parts) if HOME in path.parents else 0
-        return ("orphan", depth, "", "")
+def ensure_content_file(hash_val: str) -> Path | None:
+    prefix = hash_val[:2]
+    dest_dir = CONTENT_DIR / prefix
+    dest = dest_dir / f"{hash_val}.md"
+    if dest.exists():
+        return dest
+    return None
 
 
-def build_registry(config: dict) -> list[FileRecord]:
-    central = Path(config["central_dir"]).expanduser()
-    exclusions = config.get("exclusions", [])
-    algorithm = config.get("hash_algorithm", "sha256")
-    min_bytes = config.get("min_file_bytes", 100)
+def copy_to_content(src: Path, hash_val: str) -> Path:
+    prefix = hash_val[:2]
+    dest_dir = CONTENT_DIR / prefix
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{hash_val}.md"
+    if not dest.exists():
+        shutil.copy2(src, dest)
+    return dest
 
-    logger.info("Enumerating .md files from %s ...", HOME)
-    paths = list(enumerate_md_files(HOME, exclusions))
-    logger.info("Found %d files after exclusion filtering", len(paths))
 
-    records: list[FileRecord] = []
+def load_manifest() -> dict[str, dict]:
+    seen = {}
+    if MANIFEST_PATH.exists():
+        with open(MANIFEST_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rec = json.loads(line)
+                    seen[rec["path"]] = rec
+    return seen
+
+
+def write_manifest(records: list[dict]) -> None:
+    tmp = MANIFEST_PATH.with_suffix(".jsonl.tmp")
+    with open(tmp, "w") as f:
+        for rec in records:
+            f.write(json.dumps(rec, sort_keys=True) + "\n")
+    tmp.rename(MANIFEST_PATH)
+    logger.info("Manifest written: %d entries", len(records))
+
+
+def cmd_run(args):
+    global COMPILED_EXCLUSIONS
+    COMPILED_EXCLUSIONS = compile_exclusions(EXCLUSIONS)
+
+    logger.info("Enumerating .md files from %s ...", args.root or HOME)
+    paths = enumerate_md_files(args.root)
+    logger.info("Found %d files after exclusions", len(paths))
+
+    existing = load_manifest()
+    records = []
+    new_count = 0
+    stale_count = 0
+    active_paths = set()
     total = len(paths)
     start = time.time()
 
     for idx, path in enumerate(paths):
-        size, mtime, is_sym = stat_file(path)
-        if size < min_bytes:
-            continue
-
-        raw_hash = compute_hash(path, algorithm)
+        s = str(path)
+        active_paths.add(s)
+        raw_hash = compute_hash(path)
         if raw_hash is None:
             continue
 
+        st = path.stat()
         repo_root = detect_git_root(path)
-        kind, depth, repo_name, repo_root_str = classify_path(path, repo_root)
+        if repo_root:
+            kind = "git-tracked"
+            repo = repo_relative_name(repo_root)
+            try:
+                depth = len(path.relative_to(repo_root).parent.parts)
+            except ValueError:
+                depth = 0
+        else:
+            kind = "orphan"
+            repo = ""
+            try:
+                depth = len(path.relative_to(HOME).parent.parts)
+            except ValueError:
+                depth = 0
 
-        rec = FileRecord(
-            path=str(path),
-            hash=raw_hash,
-            hash_prefix=raw_hash[: config["flat_hash_length"]],
-            size=size,
-            mtime=mtime,
-            kind=kind,
-            depth=depth,
-            repo=repo_name,
-            repo_root=repo_root_str,
-            is_symlink=is_sym,
-            summoned_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        content_path, store_hash, orig_hash = copy_or_scrub(
+            path, raw_hash, args.scrub_secrets
         )
+        if s not in existing:
+            new_count += 1
+
+        rec = {
+            "path": s,
+            "hash": store_hash,
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+            "kind": kind,
+            "repo": repo,
+            "depth": depth,
+            "status": "active",
+        }
+        if orig_hash:
+            rec["original_hash"] = orig_hash
         records.append(rec)
 
-        if (idx + 1) % 1000 == 0:
+        if (idx + 1) % 5000 == 0:
             elapsed = time.time() - start
-            rate = (idx + 1) / elapsed if elapsed > 0 else 0
-            logger.info("  Progress: %d/%d (%.1f files/sec)", idx + 1, total, rate)
+            logger.info("  %d/%d (%.1f/s)", idx + 1, total, (idx + 1) / elapsed)
+
+    stale = [r for p, r in existing.items() if p not in active_paths]
+    for rec in stale:
+        rec["status"] = "stale"
+        records.append(rec)
+        stale_count += 1
+
+    records.sort(key=lambda r: r["path"])
+    write_manifest(records)
 
     elapsed = time.time() - start
     logger.info(
-        "Registry built: %d records in %.1fs (%.1f files/sec)",
+        "Done: %d active, %d new, %d stale, %d total in %.1fs",
+        len(records) - stale_count,
+        new_count,
+        stale_count,
         len(records),
         elapsed,
-        total / elapsed if elapsed > 0 else 0,
     )
-    return records
+
+    if args.rebuild_views:
+        rebuild_views(records)
 
 
-def write_registry(records: list[FileRecord], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        for rec in records:
-            f.write(json.dumps(asdict(rec), sort_keys=True) + "\n")
-    logger.info("Wrote %d records to %s", len(records), path)
+def _symlink_safe(target: str, link: Path) -> None:
+    link.parent.mkdir(parents=True, exist_ok=True)
+    n = 1
+    stem = link.stem
+    suffix = link.suffix
+    while link.exists() or link.is_symlink():
+        link = link.with_name(f"{stem}_{n}{suffix}")
+        n += 1
+    link.symlink_to(target)
 
 
-def registry_stats(records: list[FileRecord]) -> dict:
-    kinds: dict[str, int] = {}
-    depth_hist: dict[int, int] = {}
-    total_size = 0
-    max_size = 0
-    worst_path = ""
+def rebuild_views(records: list[dict]):
+    logger.info("Rebuilding symlink views in %s ...", DOCUMENTS_DIR)
+    for d in [
+        DOCUMENTS_DIR / "by-repo",
+        DOCUMENTS_DIR / "by-depth",
+        DOCUMENTS_DIR / "flat",
+    ]:
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True)
 
+    link_count = 0
     for rec in records:
-        kinds[rec.kind] = kinds.get(rec.kind, 0) + 1
-        d = rec.depth
-        depth_hist[d] = depth_hist.get(d, 0) + 1
-        total_size += rec.size
-        if rec.size > max_size:
-            max_size = rec.size
-            worst_path = rec.path
+        if rec["status"] != "active":
+            continue
 
-    orphan_count = kinds.get("orphan", 0)
-    tracked_count = kinds.get("git-tracked", 0) + kinds.get("symlink-resolved", 0)
+        content_rel = f"../../content/{rec['hash'][:2]}/{rec['hash']}.md"
+        content_abs = CONTENT_DIR / rec["hash"][:2] / f"{rec['hash']}.md"
+        if not content_abs.exists():
+            continue
 
-    dedup_counts: dict[str, int] = {}
-    for rec in records:
-        dedup_counts[rec.hash] = dedup_counts.get(rec.hash, 0) + 1
-    collisions = sum(1 for c in dedup_counts.values() if c > 1)
+        if rec["kind"] == "git-tracked" and rec["repo"]:
+            link = DOCUMENTS_DIR / "by-repo" / rec["repo"] / Path(rec["path"]).name
+            _symlink_safe(content_rel, link)
+            link_count += 1
+        elif rec["kind"] == "orphan":
+            src = Path(rec["path"])
+            try:
+                rel = src.relative_to(HOME)
+            except ValueError:
+                rel = Path(*src.parts[1:]) if src.is_absolute() else src
+            flat_name = rel.as_posix().replace("/", "--")
+            link = DOCUMENTS_DIR / "by-depth" / f"depth-{rec['depth']}" / flat_name
+            _symlink_safe(content_rel, link)
+            link_count += 1
 
-    return {
-        "total": len(records),
-        "kinds": kinds,
-        "orphans": orphan_count,
-        "git_tracked": tracked_count,
-        "total_size_bytes": total_size,
-        "largest_file_bytes": max_size,
-        "largest_file": worst_path,
-        "depth_histogram": dict(sorted(depth_hist.items())),
-        "dedup_candidates": collisions,
-        "unique_hashes": len(dedup_counts),
-    }
+        hpre = rec["hash"][:HASH_LEN]
+        link = DOCUMENTS_DIR / "flat" / f"{hpre}.md"
+        _symlink_safe(content_rel, link)
+        link_count += 1
 
-
-def cmd_build_registry(args):
-    config = load_config(args.config) if args.config else DEFAULT_CONFIG
-    config["flat_hash_length"] = args.hash_length or config["flat_hash_length"]
-    config["min_file_bytes"] = args.min_bytes or config["min_file_bytes"]
-
-    records = build_registry(config)
-
-    out_path = Path(args.output or config["paths"]["registry_file"])
-    if not out_path.is_absolute():
-        central = Path(config["central_dir"]).expanduser()
-        out_path = central / out_path
-    write_registry(records, out_path)
-
-    stats = registry_stats(records)
-    print(f"\n=== Registry Summary ===")
-    print(f"Total files:    {stats['total']}")
-    print(f"Git-tracked:    {stats['git_tracked']}")
-    print(f"Orphans:        {stats['orphans']}")
-    print(f"Total size:     {stats['total_size_bytes'] / 1024 / 1024:.1f} MB")
-    print(
-        f"Largest file:   {stats['largest_file']} ({stats['largest_file_bytes'] / 1024:.1f} KB)"
-    )
-    print(
-        f"Dedup cands:    {stats['dedup_candidates']} hash collisions across {stats['unique_hashes']} unique hashes"
-    )
-    print(f"\nDepth histogram (orphans):")
-    for d, c in stats["depth_histogram"].items():
-        if c > 0:
-            bar = "#" * min(c // 1000, 60)
-            print(f"  depth {d:2d}: {c:6d}  {bar}")
+    logger.info("Symlinks created: %d", link_count)
 
 
-def cmd_stats(args):
-    registry_path = Path(args.registry)
-    if not registry_path.exists():
-        logger.error("Registry not found: %s", registry_path)
+def cmd_status(args):
+    if not MANIFEST_PATH.exists():
+        logger.error("No manifest at %s", MANIFEST_PATH)
         sys.exit(1)
 
     records = []
-    with open(registry_path) as f:
+    with open(MANIFEST_PATH) as f:
         for line in f:
             line = line.strip()
             if line:
-                records.append(FileRecord(**json.loads(line)))
+                records.append(json.loads(line))
 
-    stats = registry_stats(records)
-    print(f"\n=== Registry Summary ===")
-    print(f"Total files:    {stats['total']}")
-    print(f"Git-tracked:    {stats['git_tracked']}")
-    print(f"Orphans:        {stats['orphans']}")
-    print(f"Total size:     {stats['total_size_bytes'] / 1024 / 1024:.1f} MB")
-    print(
-        f"Largest file:   {stats['largest_file']} ({stats['largest_file_bytes'] / 1024:.1f} KB)"
-    )
-    print(
-        f"Dedup cands:    {stats['dedup_candidates']} / {stats['unique_hashes']} unique hashes"
-    )
-    print(f"\nBy kind: {stats['kinds']}")
-    print(f"\nDepth histogram:")
-    for d, c in stats["depth_histogram"].items():
-        bar = "#" * min(c // 1000, 60)
-        print(f"  depth {d:2d}: {c:6d}  {bar}")
+    active = [r for r in records if r["status"] == "active"]
+    stale = [r for r in records if r["status"] == "stale"]
+    tracked = [r for r in active if r["kind"] == "git-tracked"]
+    orphans = [r for r in active if r["kind"] == "orphan"]
 
+    total_size = sum(r["size"] for r in active)
+    unique_hashes = len(set(r["hash"] for r in active))
+    content_files = sum(1 for _ in CONTENT_DIR.rglob("*.md"))
 
-def cmd_dry_run(args):
-    registry_path = Path(args.registry)
-    if not registry_path.exists():
-        logger.error("Registry not found: %s", registry_path)
-        sys.exit(1)
-
-    records = []
-    with open(registry_path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                records.append(FileRecord(**json.loads(line)))
-
-    orphans = [r for r in records if r.kind == "orphan"]
-    tracked = [r for r in records if r.kind == "git-tracked"]
-
-    print(f"\n=== Dry Run: What Would Happen ===")
-    print(f"Orphans to move:       {len(orphans)}")
-    print(f"Git-tracked to symlink: {len(tracked)}")
-    print(f"Flat entries to create: {len(records)}")
-    print(f"Breadcrumbs to write:   {len(orphans)}")
-    print(f"Central dir:            ~/Meta/Documents/")
+    print(f"\n=== _doc Status ===")
+    print(f"Active files:     {len(active)}")
+    print(f"  Git-tracked:    {len(tracked)}")
+    print(f"  Orphans:        {len(orphans)}")
+    print(f"Stale (deleted):  {len(stale)}")
+    print(f"Unique hashes:    {unique_hashes}")
+    print(f"Content files:    {content_files}")
+    print(f"Total size:       {total_size / 1024 / 1024:.1f} MB")
+    print(f"Manifest:         {MANIFEST_PATH}")
 
     if args.verbose:
-        print(f"\nTop 10 largest orphans:")
-        by_size = sorted(orphans, key=lambda r: r.size, reverse=True)
-        for rec in by_size[:10]:
-            print(f"  {rec.path} ({rec.size / 1024:.1f} KB)")
+        if orphans:
+            print(f"\nOrphans by depth:")
+            depth_counts: dict[int, int] = {}
+            for r in orphans:
+                depth_counts[r["depth"]] = depth_counts.get(r["depth"], 0) + 1
+            for d in sorted(depth_counts):
+                print(f"  depth {d:2d}: {depth_counts[d]}")
 
-        orphans_by_depth: dict[int, list[str]] = {}
-        for rec in orphans:
-            orphans_by_depth.setdefault(rec.depth, []).append(rec.path)
-        print(f"\nOrphans by depth:")
-        for d in sorted(orphans_by_depth):
-            print(f"  depth {d}: {len(orphans_by_depth[d])} files")
-
-        tracked_by_repo: dict[str, int] = {}
-        for rec in tracked:
-            tracked_by_repo[rec.repo] = tracked_by_repo.get(rec.repo, 0) + 1
-        print(f"\nTop 10 repos by .md count:")
-        for repo, count in sorted(tracked_by_repo.items(), key=lambda x: -x[1])[:10]:
-            print(f"  {repo}: {count}")
+        if tracked:
+            print(f"\nTop repos by .md count:")
+            repo_counts: dict[str, int] = {}
+            for r in tracked:
+                repo_counts[r["repo"]] = repo_counts.get(r["repo"], 0) + 1
+            for repo, count in sorted(repo_counts.items(), key=lambda x: -x[1])[:15]:
+                print(f"  {repo}: {count}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="md-summoning tool")
-    parser.add_argument("--config", "-c", type=Path, help="Path to summon.yaml")
+    COMPILED_EXCLUSIONS.clear()
+    COMPILED_EXCLUSIONS.extend(compile_exclusions(EXCLUSIONS))
+
+    parser = argparse.ArgumentParser(description="md-knowledge: canonical .md archive")
     parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
-    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_build = sub.add_parser(
-        "build-registry", help="Phase 0: enumerate, classify, hash"
+    p_run = sub.add_parser("run", help="Build/update the archive")
+    p_run.add_argument("--root", type=Path, help="Scan root (default: ~)")
+    p_run.add_argument(
+        "--no-views", action="store_true", help="Skip symlink view rebuild"
     )
-    p_build.add_argument("--output", "-o", help="Output path for registry.jsonl")
-    p_build.add_argument("--hash-length", type=int, help="Flat hash prefix length")
-    p_build.add_argument("--min-bytes", type=int, help="Minimum file size in bytes")
-    p_build.set_defaults(func=cmd_build_registry)
+    p_run.add_argument(
+        "--scrub-secrets",
+        action="store_true",
+        help="Redact API keys, tokens, passwords before storing",
+    )
+    p_run.set_defaults(func=cmd_run)
 
-    p_stats = sub.add_parser("stats", help="Print statistics from existing registry")
-    p_stats.add_argument("registry", type=str, help="Path to registry.jsonl")
-    p_stats.set_defaults(func=cmd_stats)
-
-    p_dry = sub.add_parser("dry-run", help="Phase 1: simulate without executing")
-    p_dry.add_argument("registry", type=str, help="Path to registry.jsonl")
-    p_dry.set_defaults(func=cmd_dry_run)
+    p_status = sub.add_parser("status", help="Print archive statistics")
+    p_status.add_argument(
+        "-v", "--verbose", action="store_true", help="Detailed breakdown"
+    )
+    p_status.set_defaults(func=cmd_status)
 
     args = parser.parse_args()
-
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
 
-    args.func(args)
+    modified_args = args
+    if hasattr(args, "no_views"):
+        modified_args.rebuild_views = not args.no_views
+    else:
+        modified_args.rebuild_views = False
+
+    args.func(modified_args)
 
 
 if __name__ == "__main__":
