@@ -557,6 +557,49 @@ def cmd_summarize(args):
                 print(f"  ~ {prev[p]['hash'][:12]} -> {r['hash'][:12]}  {p}")
 
 
+def cmd_grep(args):
+    """Search content files with ripgrep."""
+    cmd = ["rg", "--no-heading", "--color", "never"]
+    if args.ignore_case:
+        cmd.append("-i")
+    if args.count:
+        cmd.append("--count")
+    if args.files_with_matches:
+        cmd.append("--files-with-matches")
+    cmd.extend(["-e", args.pattern, str(CONTENT_DIR)])
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if args.resolve:
+        manifest = load_manifest()
+        hash_to_path: dict[str, list[str]] = {}
+        for p, r in manifest.items():
+            if r["status"] == "active":
+                hash_to_path.setdefault(r["hash"], []).append(p)
+
+        for line in result.stdout.splitlines():
+            sep = line.find(":")
+            if sep >= 0:
+                content_path = line[:sep]
+                remainder = line[sep:]
+            else:
+                content_path = line
+                remainder = ""
+            cp = Path(content_path)
+            full_hash = cp.stem
+            originals = hash_to_path.get(full_hash, [])
+            if originals:
+                for orig in originals:
+                    sys.stdout.write(f"{orig}{remainder}\n")
+            else:
+                sys.stdout.write(f"{line}\n")
+    else:
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+
+    sys.exit(result.returncode)
+
+
 def main():
     COMPILED_EXCLUSIONS.clear()
     COMPILED_EXCLUSIONS.extend(compile_exclusions(EXCLUSIONS))
@@ -608,6 +651,27 @@ def main():
         "--limit", type=int, default=20, help="Max files per section (default 20)"
     )
     p_summarize.set_defaults(func=cmd_summarize)
+
+    p_grep = sub.add_parser("grep", help="Search content with ripgrep")
+    p_grep.add_argument("pattern", help="Search pattern (regex)")
+    p_grep.add_argument(
+        "-i", "--ignore-case", action="store_true", help="Case-insensitive"
+    )
+    p_grep.add_argument(
+        "--resolve",
+        action="store_true",
+        help="Show original paths instead of hash paths",
+    )
+    p_grep.add_argument(
+        "-c", "--count", action="store_true", help="Show match counts per file"
+    )
+    p_grep.add_argument(
+        "-l",
+        "--files-with-matches",
+        action="store_true",
+        help="Show only filenames with matches",
+    )
+    p_grep.set_defaults(func=cmd_grep)
 
     args = parser.parse_args()
     logging.basicConfig(
