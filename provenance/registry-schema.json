@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MD-Summoning Registry Entry",
+  "description": "One JSON-Line per .md file summoned into ~/Meta/Documents",
+  "type": "object",
+  "required": [
+    "path",
+    "hash",
+    "size",
+    "mtime",
+    "kind",
+    "depth",
+    "central_path",
+    "summoned_at"
+  ],
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "Absolute path of the original file",
+      "examples": ["/Users/4jp/foo.md"]
+    },
+    "hash": {
+      "type": "string",
+      "description": "Full SHA256 hex digest of file content",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "hash_prefix": {
+      "type": "string",
+      "description": "First N characters of SHA256 for flat/ naming",
+      "pattern": "^[a-f0-9]+$"
+    },
+    "size": {
+      "type": "integer",
+      "description": "File size in bytes",
+      "minimum": 0
+    },
+    "mtime": {
+      "type": "number",
+      "description": "Last modification time as Unix timestamp (float)"
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["git-tracked", "orphan", "git-dirty", "symlink-resolved"],
+      "description": "Classification of the file"
+    },
+    "repo": {
+      "type": "string",
+      "description": "Repo-relative path if git-tracked. Empty string for orphans.",
+      "examples": ["4444J99/domus-semper-palingenesis"]
+    },
+    "repo_root": {
+      "type": "string",
+      "description": "Absolute path to repo root, if git-tracked"
+    },
+    "depth": {
+      "type": "integer",
+      "description": "Depth from home root (orphans) or repo root (tracked)",
+      "minimum": 0
+    },
+    "central_path": {
+      "type": "string",
+      "description": "Path relative to ~/Meta/Documents/ where the file lives",
+      "examples": ["by-depth/depth-2/foo.md", "by-repo/4444J99--domus/README.md"]
+    },
+    "flat_name": {
+      "type": "string",
+      "description": "Filename in flat/ directory (hash-prefix based)",
+      "examples": ["a1b2c3d4e5f6.md"]
+    },
+    "is_symlink": {
+      "type": "boolean",
+      "description": "Whether the central_path entry is a symlink (true) or actual file (false)"
+    },
+    "summoned_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when the file was summoned"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["active", "stale", "moved", "error"],
+      "description": "Current status in the registry"
+    },
+    "note": {
+      "type": "string",
+      "description": "Optional human-readable note (e.g., warning, error message)"
+    }
+  },
+  "additionalProperties": false
+}
