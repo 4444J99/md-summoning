@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import logging
@@ -600,6 +601,64 @@ def cmd_grep(args):
     sys.exit(result.returncode)
 
 
+def cmd_feed(args):
+    """Export archive content in consumer-friendly formats."""
+    records = load_manifest()
+    active = [r for r in records.values() if r["status"] == "active"]
+
+    if args.kind and args.kind != "all":
+        active = [r for r in active if r["kind"] == args.kind]
+
+    if args.limit:
+        active = active[: args.limit]
+
+    if args.format == "csv":
+        w = csv.writer(sys.stdout)
+        w.writerow(["path", "hash", "size", "kind", "repo", "depth", "mtime"])
+        for r in active:
+            w.writerow(
+                [
+                    r["path"],
+                    r["hash"],
+                    r["size"],
+                    r["kind"],
+                    r.get("repo", ""),
+                    r["depth"],
+                    r["mtime"],
+                ]
+            )
+
+    elif args.format == "jsonl":
+        for idx, r in enumerate(active):
+            cp = CONTENT_DIR / r["hash"][:2] / f"{r['hash']}.md"
+            body = (
+                cp.read_text(encoding="utf-8", errors="replace") if cp.exists() else ""
+            )
+            out = {k: r[k] for k in ["path", "hash", "size", "kind", "depth", "status"]}
+            if r.get("repo"):
+                out["repo"] = r["repo"]
+            out["content"] = body
+            sys.stdout.write(json.dumps(out, sort_keys=True) + "\n")
+            if (idx + 1) % 5000 == 0:
+                logger.info("  feed %d/%d", idx + 1, len(active))
+
+    elif args.format == "paths":
+        for r in active:
+            sys.stdout.write(r["path"] + "\n")
+
+    elif args.format == "summary":
+        print(f"kind,count,unique_hashes,size_mb")
+        for kind in ["git-tracked", "orphan"]:
+            subset = [r for r in active if r["kind"] == kind]
+            if subset:
+                hashes = len(set(r["hash"] for r in subset))
+                size = sum(r["size"] for r in subset) / 1024 / 1024
+                print(f"{kind},{len(subset)},{hashes},{size:.1f}")
+
+    total = len(active)
+    logger.info("Feed written: %d entries (%s)", total, args.format)
+
+
 def main():
     COMPILED_EXCLUSIONS.clear()
     COMPILED_EXCLUSIONS.extend(compile_exclusions(EXCLUSIONS))
@@ -672,6 +731,19 @@ def main():
         help="Show only filenames with matches",
     )
     p_grep.set_defaults(func=cmd_grep)
+
+    p_feed = sub.add_parser("feed", help="Export archive content for consumers")
+    p_feed.add_argument(
+        "--format",
+        default="jsonl",
+        choices=["csv", "jsonl", "paths", "summary"],
+        help="Output format (default jsonl)",
+    )
+    p_feed.add_argument(
+        "--kind", choices=["all", "git-tracked", "orphan"], default="all"
+    )
+    p_feed.add_argument("--limit", type=int, help="Max entries to export")
+    p_feed.set_defaults(func=cmd_feed)
 
     args = parser.parse_args()
     logging.basicConfig(
