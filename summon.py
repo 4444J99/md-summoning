@@ -430,6 +430,133 @@ def cmd_status(args):
                 print(f"  {repo}: {count}")
 
 
+def cmd_verify(args):
+    """Verify content integrity against manifest."""
+    records = load_manifest()
+    active = [r for r in records.values() if r["status"] == "active"]
+    total = len(active)
+    missing = 0
+    hash_ok = 0
+    hash_bad = 0
+    errors = []
+
+    for idx, rec in enumerate(active):
+        h = rec["hash"]
+        cp = CONTENT_DIR / h[:2] / f"{h}.md"
+        if not cp.exists():
+            missing += 1
+            errors.append(f"  MISSING {h[:12]}  {rec['path']}")
+            if args.repair:
+                src = Path(rec["path"])
+                if src.exists():
+                    shutil.copy2(src, cp)
+                    errors.append(f"    -> repaired from {src}")
+                else:
+                    errors.append(f"    -> source gone, cannot repair")
+
+        elif args.check_hash:
+            actual = compute_hash(cp)
+            if actual != h:
+                hash_bad += 1
+                errors.append(f"  HASH BAD {h[:12]}  {rec['path']}")
+                if args.repair:
+                    src = Path(rec["path"])
+                    if src.exists():
+                        shutil.copy2(src, cp)
+                        errors.append(f"    -> repaired from {src}")
+            else:
+                hash_ok += 1
+
+        if (idx + 1) % 10000 == 0:
+            logger.info("  verified %d/%d", idx + 1, total)
+
+    if not args.check_hash:
+        hash_ok = total - missing
+
+    print(f"\n=== Verify ===")
+    print(f"Active entries:  {total}")
+    print(f"Content OK:      {hash_ok}")
+    print(
+        f"Missing:         {missing}"
+        + (" (repaired)" if args.repair and missing > 0 else "")
+    )
+    if args.check_hash:
+        print(f"Hash mismatches: {hash_bad}")
+    if args.verbose and errors:
+        print(f"\nDetails:")
+        for e in errors:
+            print(e)
+
+
+def cmd_summarize(args):
+    """Show changes since last committed manifest."""
+    records = load_manifest()
+    active_set = {p for p, r in records.items() if r["status"] == "active"}
+    active_recs = [r for r in records.values() if r["status"] == "active"]
+    stale_recs = [r for r in records.values() if r["status"] == "stale"]
+
+    added = [
+        r
+        for r in active_recs
+        if r.get("status") == "active"
+        and r["path"] not in {s["path"] for s in stale_recs}
+    ]  # simplified below
+    # Actually compute diff against last git commit's manifest
+    try:
+        result = subprocess.run(
+            ["git", "show", "HEAD:manifest.jsonl"],
+            capture_output=True,
+            text=True,
+            cwd=DOC_DIR,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            print("No prior committed manifest to compare against.")
+            return
+        prev = {}
+        for line in result.stdout.strip().splitlines():
+            if line.strip():
+                rec = json.loads(line)
+                if rec["status"] == "active":
+                    prev[rec["path"]] = rec
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"Cannot read prior manifest: {e}")
+        return
+
+    curr = {r["path"]: r for r in active_recs}
+    prev_paths = set(prev)
+    curr_paths = set(curr)
+
+    added_paths = curr_paths - prev_paths
+    removed_paths = prev_paths - curr_paths
+    changed = []
+    for p in curr_paths & prev_paths:
+        if curr[p]["hash"] != prev[p]["hash"]:
+            changed.append(p)
+
+    print(f"\n=== Changes since last commit ===")
+    print(f"New files:       {len(added_paths)}")
+    print(f"Removed:         {len(removed_paths)}")
+    print(f"Changed (hash):  {len(changed)}")
+    print(f"Total active:    {len(curr_paths)}")
+
+    if args.verbose and (added_paths or removed_paths or changed):
+        if added_paths:
+            print(f"\n--- Added ({len(added_paths)}) ---")
+            for p in sorted(added_paths)[: args.limit]:
+                r = curr[p]
+                print(f"  + {r['hash'][:12]}  {r['kind']:12s}  {p}")
+        if removed_paths:
+            print(f"\n--- Removed ({len(removed_paths)}) ---")
+            for p in sorted(removed_paths)[: args.limit]:
+                print(f"  - {prev[p]['hash'][:12]}  {p}")
+        if changed:
+            print(f"\n--- Changed ({len(changed)}) ---")
+            for p in sorted(changed)[: args.limit]:
+                r = curr[p]
+                print(f"  ~ {prev[p]['hash'][:12]} -> {r['hash'][:12]}  {p}")
+
+
 def main():
     COMPILED_EXCLUSIONS.clear()
     COMPILED_EXCLUSIONS.extend(compile_exclusions(EXCLUSIONS))
@@ -458,6 +585,29 @@ def main():
         "-v", "--verbose", action="store_true", help="Detailed breakdown"
     )
     p_status.set_defaults(func=cmd_status)
+
+    p_verify = sub.add_parser("verify", help="Verify content integrity")
+    p_verify.add_argument(
+        "--check-hash", action="store_true", help="Recompute and verify SHA256"
+    )
+    p_verify.add_argument(
+        "--repair",
+        action="store_true",
+        help="Re-copy missing/corrupt files from source",
+    )
+    p_verify.add_argument(
+        "-v", "--verbose", action="store_true", help="Show each issue"
+    )
+    p_verify.set_defaults(func=cmd_verify)
+
+    p_summarize = sub.add_parser("summarize", help="Show changes since last commit")
+    p_summarize.add_argument(
+        "-v", "--verbose", action="store_true", help="Show per-file details"
+    )
+    p_summarize.add_argument(
+        "--limit", type=int, default=20, help="Max files per section (default 20)"
+    )
+    p_summarize.set_defaults(func=cmd_summarize)
 
     args = parser.parse_args()
     logging.basicConfig(
