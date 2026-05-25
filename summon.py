@@ -54,23 +54,23 @@ EXCLUDED_PREFIXES = ["/Users/4jp/_doc/"]
 COMPILED_EXCLUSIONS: list[re.Pattern] = []
 
 SECRET_PATTERNS: list[re.Pattern] = [
-    re.compile(r"(sk-[A-Za-z0-9]{20,})"),  # OpenAI
-    re.compile(r"(sk-ant-[A-Za-z0-9]{20,})"),  # Anthropic
-    re.compile(r"(gh[pousr]_[A-Za-z0-9]{36,})"),  # GitHub tokens
-    re.compile(r"(xox[bpras]-[A-Za-z0-9-]{20,})"),  # Slack
-    re.compile(r"(AKIA[0-9A-Z]{16})"),  # AWS access key ID
+    re.compile(r"(sk-)[A-Za-z0-9]{20,}"),  # OpenAI
+    re.compile(r"(sk-ant-)[A-Za-z0-9]{20,}"),  # Anthropic
+    re.compile(r"(gh[pousr]_)[A-Za-z0-9]{36,}"),  # GitHub tokens
+    re.compile(r"(xox[bpras]-)[A-Za-z0-9-]{20,}"),  # Slack
+    re.compile(r"(AKIA)[0-9A-Z]{16}"),  # AWS access key ID
     re.compile(
         r"(-----BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY-----).+?"
         r"-----END \2 PRIVATE KEY-----",
         re.DOTALL,
-    ),  # Private key block
+    ),  # Private key block — \2 is internal backreference for matching key type
     re.compile(
-        r"(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})"
+        r"(eyJ)[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
     ),  # JWT
-    re.compile(r"(AIza[0-9A-Za-z_-]{35})"),  # Google API key
-    re.compile(r"(1qaz2wsx3edc[a-zA-Z0-9_\-]{16,})"),  # Telegram bot token
-    re.compile(r"(sk_live_[0-9a-zA-Z]{20,})"),  # Stripe live key
-    re.compile(r"(rk_live_[0-9a-zA-Z]{20,})"),  # Stripe live restricted
+    re.compile(r"(AIza)[0-9A-Za-z_-]{35}"),  # Google API key
+    re.compile(r"(1qaz2wsx3edc)[a-zA-Z0-9_\-]{16,}"),  # Telegram bot token
+    re.compile(r"(sk_live_)[0-9a-zA-Z]{20,}"),  # Stripe live key
+    re.compile(r"(rk_live_)[0-9a-zA-Z]{20,}"),  # Stripe live restricted
 ]
 
 
@@ -571,13 +571,15 @@ def cmd_grep(args):
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
-    if args.resolve:
-        manifest = load_manifest()
-        hash_to_path: dict[str, list[str]] = {}
-        for p, r in manifest.items():
-            if r["status"] == "active":
-                hash_to_path.setdefault(r["hash"], []).append(p)
+    manifest = load_manifest()
+    hash_to_path: dict[str, list[str]] = {}
+    for p, r in manifest.items():
+        if r["status"] == "active":
+            if args.repo and args.repo not in (r.get("repo") or ""):
+                continue
+            hash_to_path.setdefault(r["hash"], []).append(p)
 
+    if args.resolve:
         for line in result.stdout.splitlines():
             sep = line.find(":")
             if sep >= 0:
@@ -608,6 +610,8 @@ def cmd_feed(args):
 
     if args.kind and args.kind != "all":
         active = [r for r in active if r["kind"] == args.kind]
+    if args.repo:
+        active = [r for r in active if args.repo in (r.get("repo") or "")]
 
     if args.limit:
         active = active[: args.limit]
@@ -657,6 +661,100 @@ def cmd_feed(args):
 
     total = len(active)
     logger.info("Feed written: %d entries (%s)", total, args.format)
+
+
+def cmd_prune(args):
+    """Remove stale entries older than N days from the manifest."""
+    records = list(load_manifest().values())
+    now = time.time()
+    cutoff = now - args.days * 86400
+    kept = []
+    pruned = 0
+    for r in records:
+        if r["status"] == "stale" and r.get("mtime", 0) < cutoff:
+            pruned += 1
+        else:
+            kept.append(r)
+    kept.sort(key=lambda r: r["path"])
+    write_manifest(kept)
+    logger.info("Pruned %d stale entries (cutoff: >%d days)", pruned, args.days)
+
+
+def cmd_restore(args):
+    """Re-hydrate missing content files from their source paths."""
+    records = load_manifest()
+    active = [r for r in records.values() if r["status"] == "active"]
+    restored = 0
+    skipped = 0
+    errors = 0
+    for idx, rec in enumerate(active):
+        h = rec["hash"]
+        cp = CONTENT_DIR / h[:2] / f"{h}.md"
+        if cp.exists():
+            skipped += 1
+            continue
+        src = Path(rec["path"])
+        if not src.exists():
+            logger.warning("Source gone: %s", rec["path"])
+            errors += 1
+            continue
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, cp)
+        restored += 1
+        if args.verbose:
+            logger.info("Restored %s -> %s", rec["path"], cp)
+        if (idx + 1) % 5000 == 0:
+            logger.info("  restore %d/%d", idx + 1, len(active))
+    logger.info(
+        "Restore done: %d restored, %d skipped, %d errors", restored, skipped, errors
+    )
+
+
+def cmd_fzf(args):
+    """Interactive fuzzy search over archive paths using fzf."""
+    fzf_path = shutil.which("fzf")
+    if not fzf_path:
+        logger.error("fzf not found — install with 'brew install fzf'")
+        sys.exit(1)
+    records = load_manifest()
+    active = [r for r in records.values() if r["status"] == "active"]
+    if args.repo:
+        active = [r for r in active if args.repo in (r.get("repo") or "")]
+    if args.kind and args.kind != "all":
+        active = [r for r in active if r["kind"] == args.kind]
+    fzf = subprocess.Popen(
+        [
+            fzf_path,
+            "--delimiter",
+            " ",
+            "--with-nth",
+            "3..",
+            "--preview",
+            f"bat --color=always --wrap=never --line-range=:30 '{CONTENT_DIR}/'+{{1}}[:2]+'/'+{{1}}+'.md' 2>/dev/null || cat '{CONTENT_DIR}/'+{{1}}[:2]+'/'+{{1}}+'.md'",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    for r in active:
+        h = r["hash"]
+        cp = CONTENT_DIR / h[:2] / f"{h}.md"
+        if cp.exists():
+            fzf.stdin.write(f"{h[:12]} {h} {r['path']}  [{r['kind']}]\n")
+    fzf.stdin.close()
+    selected = fzf.stdout.readline()
+    fzf.wait()
+    if selected:
+        parts = selected.strip().split(" ", 2)
+        if len(parts) >= 3:
+            hash_val = parts[1] if len(parts[0]) == 12 else parts[0]
+            cp = CONTENT_DIR / hash_val[:2] / f"{hash_val}.md"
+            if cp.exists():
+                subprocess.run(
+                    ["bat", "--paging=always", str(cp)]
+                    if shutil.which("bat")
+                    else ["cat", str(cp)]
+                )
 
 
 def main():
@@ -730,6 +828,7 @@ def main():
         action="store_true",
         help="Show only filenames with matches",
     )
+    p_grep.add_argument("--repo", help="Filter by source repo (e.g. domus--semper)")
     p_grep.set_defaults(func=cmd_grep)
 
     p_feed = sub.add_parser("feed", help="Export archive content for consumers")
@@ -742,8 +841,33 @@ def main():
     p_feed.add_argument(
         "--kind", choices=["all", "git-tracked", "orphan"], default="all"
     )
+    p_feed.add_argument("--repo", help="Filter by source repo (e.g. domus--semper)")
     p_feed.add_argument("--limit", type=int, help="Max entries to export")
     p_feed.set_defaults(func=cmd_feed)
+
+    p_prune = sub.add_parser("prune", help="Remove stale entries older than N days")
+    p_prune.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="Delete stale entries older than N days (default 30)",
+    )
+    p_prune.set_defaults(func=cmd_prune)
+
+    p_restore = sub.add_parser(
+        "restore", help="Re-hydrate missing content from source paths"
+    )
+    p_restore.add_argument(
+        "-v", "--verbose", action="store_true", help="Show each restored file"
+    )
+    p_restore.set_defaults(func=cmd_restore)
+
+    p_fzf = sub.add_parser("fzf", help="Interactive fuzzy search over archive")
+    p_fzf.add_argument(
+        "--kind", choices=["all", "git-tracked", "orphan"], default="all"
+    )
+    p_fzf.add_argument("--repo", help="Filter by source repo")
+    p_fzf.set_defaults(func=cmd_fzf)
 
     args = parser.parse_args()
     logging.basicConfig(
