@@ -3,7 +3,8 @@ set -euo pipefail
 PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
 SUMMON_DIR="/Users/4jp/Workspace/4444J99/summoning"
-DOC_DIR="/Users/4jp/_doc"
+WORK_DIR="/Users/4jp/_doc"                      # summon.py hardcoded working output (DOC_DIR in summon.py)
+MANIFEST_REPO="/Users/4jp/_portal/config/_doc"  # canonical manifest home since 2026-06-01 consolidation
 LOG_DIR="/tmp/summon-daily-logs"
 RETENTION=7
 
@@ -16,8 +17,11 @@ echo "=== summon-daily: $(date) ==="
 cd "$SUMMON_DIR"
 python3 summon.py run --scrub-secrets 2>&1
 
-cd "$DOC_DIR"
-git add manifest.jsonl .gitignore
+# Publish the manifest into the canonical git repo (~/_doc was de-gitted 2026-06-01;
+# committing there failed silently every morning — see .MOVED-TO.md breadcrumbs).
+cp "$WORK_DIR/manifest.jsonl" "$MANIFEST_REPO/manifest.jsonl"
+cd "$MANIFEST_REPO"
+git add manifest.jsonl
 if git diff --cached --quiet; then
   echo "Nothing to commit."
 else
