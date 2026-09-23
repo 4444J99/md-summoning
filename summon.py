@@ -86,11 +86,10 @@ def copy_or_scrub(
     src: Path, hash_val: str, scrub: bool
 ) -> tuple[Path, str, str | None]:
     """Copy (or scrub) src into content store. Returns (dest_path, store_hash, original_hash)."""
-    prefix = hash_val[:2]
-    dest_dir = CONTENT_DIR / prefix
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
     if not scrub:
+        prefix = hash_val[:2]
+        dest_dir = CONTENT_DIR / prefix
+        dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / f"{hash_val}.md"
         if not dest.exists():
             shutil.copy2(src, dest)
@@ -99,6 +98,9 @@ def copy_or_scrub(
     original_hash = hash_val
     scrubbed = apply_scrub(src.read_bytes())
     store_hash = hashlib.sha256(scrubbed).hexdigest()
+    prefix = store_hash[:2]
+    dest_dir = CONTENT_DIR / prefix
+    dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f"{store_hash}.md"
     if not dest.exists():
         dest.write_bytes(scrubbed)
