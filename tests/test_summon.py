@@ -108,7 +108,7 @@ class TestScrub:
         )
         result = apply_scrub(text)
         assert b"***REDACTED***" in result
-        assert b"MIIEpAIBAAKCAQ0OcH2J7RkPdKw==" not in result
+        assert b"MIIEpAIBAAKCAQEA0OcH2J7RkPdKw==" not in result
 
     def test_jwt(self):
         text = b"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNrxPmIebTTi"  # allow-secret
@@ -305,6 +305,7 @@ class TestFeed:
             format = "summary"
             kind = "all"
             repo = None
+            limit = None
 
         cmd_feed(Args())
         captured = capsys.readouterr()
