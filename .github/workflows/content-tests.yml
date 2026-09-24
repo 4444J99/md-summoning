@@ -1,0 +1,49 @@
+name: Content archive tests
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['summon.py', 'tests/**', '.github/workflows/content-tests.yml']
+  push:
+    branches: [main]
+    paths: ['summon.py', 'tests/**', '.github/workflows/content-tests.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  content-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.11'
+      - name: Install test dependencies
+        run: python -m pip install pytest==9.1.1
+      - name: Record and stage exact test sources only
+        run: |
+          mkdir -p "$RUNNER_TEMP/content-source/tests"
+          git log -1 --format='%H %P' > "$RUNNER_TEMP/content-source/checkout.txt"
+          git ls-files -s -- summon.py tests > "$RUNNER_TEMP/content-source/git-blobs.txt"
+          cp summon.py "$RUNNER_TEMP/content-source/"
+          cp tests/*.py "$RUNNER_TEMP/content-source/tests/"
+          cat "$RUNNER_TEMP/content-source/checkout.txt" "$RUNNER_TEMP/content-source/git-blobs.txt"
+      - name: Retain source-only verification artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: content-addressing-source
+          path: ${{ runner.temp }}/content-source/
+          if-no-files-found: error
+          retention-days: 1
+      - name: Focused isolated content addressing tests
+        run: python -B -m pytest -q tests/test_scrubbed_content_address.py
+      - name: Verify clean checkout
+        run: |
+          git diff --check
+          git diff --exit-code
