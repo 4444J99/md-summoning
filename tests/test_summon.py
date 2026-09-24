@@ -35,23 +35,24 @@ from summon import (
 # ── helpers ──────────────────────────────────────────────────────────
 
 
-@pytest.fixture
-def tmp_doc(tmp_path: Path) -> Path:
-    """Set up a minimal doc archive in a temp dir, monkeypatch paths."""
-    content_dir = tmp_path / "content"
-    content_dir.mkdir()
-    manifest = tmp_path / "manifest.jsonl"
-    documents = tmp_path / "Documents"
-    documents.mkdir()
-
+@pytest.fixture(autouse=True)
+def tmp_doc(tmp_path: Path, monkeypatch) -> Path:
+    """Give every test a disposable archive and restore module globals afterward."""
     import summon as mod
 
-    mod.DOC_DIR = tmp_path
-    mod.CONTENT_DIR = content_dir
-    mod.MANIFEST_PATH = manifest
-    mod.DOCUMENTS_DIR = documents
-
-    return tmp_path
+    archive = tmp_path / "archive"
+    content_dir = archive / "content"
+    content_dir.mkdir(parents=True)
+    documents = archive / "Documents"
+    documents.mkdir()
+    monkeypatch.setattr(mod, "HOME", tmp_path)
+    monkeypatch.setattr(mod, "DOC_DIR", archive)
+    monkeypatch.setattr(mod, "CONTENT_DIR", content_dir)
+    monkeypatch.setattr(mod, "MANIFEST_PATH", archive / "manifest.jsonl")
+    monkeypatch.setattr(mod, "DOCUMENTS_DIR", documents)
+    monkeypatch.setattr(mod, "COMPILED_EXCLUSIONS", list(mod.COMPILED_EXCLUSIONS))
+    monkeypatch.setattr(mod, "EXCLUDED_PREFIXES", [*mod.EXCLUDED_PREFIXES, str(archive) + "/"])
+    return archive
 
 
 def make_file(path: Path, text: str = "hello") -> Path:
@@ -393,18 +394,19 @@ class TestGrep:
             resolve = False
             repo = None
 
-        # We can just check it doesn't crash (grep runs against real _doc)
-        # Exit code may be 1 if no matches
+        # The isolated archive is empty; ripgrep reports no matches.
         with pytest.raises(SystemExit):
             cmd_grep(Args())
 
-    def test_grep_repo_filter(self):
+    def test_grep_repo_filter(self, tmp_doc):
         """--repo filter in grep builds correct hash_to_path."""
         from summon import cmd_grep
 
-        # Unit-test the filtering logic by checking
-        # that the manifest filter works correctly
+        # Populate a synthetic record so the assertion cannot pass vacuously.
+        write_manifest([{"path": str(tmp_doc / "source.md"), "hash": "aa",
+                         "status": "active", "repo": "test--repo"}])
         manifest = load_manifest()
+        assert len(manifest) == 1
         for p, r in manifest.items():
             if r["status"] == "active" and r.get("repo"):
                 repo = r["repo"]
@@ -441,9 +443,29 @@ class TestFzf:
 @pytest.mark.parametrize(
     "cmd", ["status", "verify", "summarize", "feed --format paths --limit 1"]
 )
-def test_cli_smoke(cmd):
-    """Each main subcommand runs without crashing against the real archive."""
-    full = f"python3 -m summon {cmd}"
-    result = subprocess.run(full.split(), capture_output=True, text=True, timeout=60)
-    # Some return code 1 (no changes), 0 is success
+def test_cli_smoke(cmd, tmp_doc):
+    """Run the real CLI parser/commands in a subprocess against a temporary archive."""
+    # Production currently has a fixed archive path. Override only module state
+    # in this subprocess harness rather than touching the user's real archive.
+    source_root = str(Path(__file__).resolve().parent.parent)
+    harness = "\n".join([
+        "import sys",
+        "from pathlib import Path",
+        f"sys.path.insert(0, {source_root!r})",
+        "import summon",
+        f"summon.DOC_DIR = Path({str(tmp_doc)!r})",
+        "summon.HOME = summon.DOC_DIR.parent",
+        "summon.CONTENT_DIR = summon.DOC_DIR / 'content'",
+        "summon.MANIFEST_PATH = summon.DOC_DIR / 'manifest.jsonl'",
+        "summon.DOCUMENTS_DIR = summon.DOC_DIR / 'Documents'",
+        "summon.EXCLUDED_PREFIXES = [str(summon.DOC_DIR) + '/']",
+        f"sys.argv = ['summon', *{cmd.split()!r}]",
+        "summon.main()",
+    ])
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", harness], cwd=tmp_doc,
+        capture_output=True, text=True, timeout=60,
+    )
+    # Preserve the existing acceptance contract: 1 may report no changes.
     assert result.returncode in (0, 1), f"{cmd} failed: {result.stderr[:200]}"
+    assert "Traceback" not in result.stderr
